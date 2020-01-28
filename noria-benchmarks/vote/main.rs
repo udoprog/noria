@@ -7,7 +7,6 @@ use hdrhistogram::Histogram;
 use rand::prelude::*;
 use rand_distr::Exp;
 use std::cell::RefCell;
-use std::fs;
 use std::mem;
 use std::sync::{atomic, Arc, Barrier, Mutex};
 use std::task::Poll;
@@ -16,10 +15,10 @@ use std::time;
 use tower_service::Service;
 
 thread_local! {
-    static SJRN_W: RefCell<Histogram<u64>> = RefCell::new(Histogram::new_with_bounds(10, 1_000_000, 4).unwrap());
-    static SJRN_R: RefCell<Histogram<u64>> = RefCell::new(Histogram::new_with_bounds(10, 1_000_000, 4).unwrap());
-    static RMT_W: RefCell<Histogram<u64>> = RefCell::new(Histogram::new_with_bounds(10, 1_000_000, 4).unwrap());
-    static RMT_R: RefCell<Histogram<u64>> = RefCell::new(Histogram::new_with_bounds(10, 1_000_000, 4).unwrap());
+    static SJRN_W: RefCell<Sampler> = RefCell::new(Sampler::new());
+    static SJRN_R: RefCell<Sampler> = RefCell::new(Sampler::new());
+    static RMT_W: RefCell<Sampler> = RefCell::new(Sampler::new());
+    static RMT_R: RefCell<Sampler> = RefCell::new(Sampler::new());
 }
 
 fn throughput(ops: usize, took: time::Duration) -> f64 {
@@ -30,6 +29,38 @@ const MAX_BATCH_TIME_US: u32 = 1000;
 
 mod clients;
 use self::clients::{Parameters, ReadRequest, VoteClient, WriteRequest};
+
+struct Sampler {
+    min: u64,
+    max: u64,
+    hist: Histogram<u64>,
+}
+
+impl Sampler {
+    pub fn new() -> Self {
+        Self {
+            min: std::u64::MAX,
+            max: std::u64::MIN,
+            hist: Histogram::<u64>::new_with_bounds(10, 1_000_000, 4).unwrap(),
+        }
+    }
+
+    pub fn add(&mut self, other: &Self) -> Result<(), hdrhistogram::AdditionError> {
+        self.min = u64::min(self.min, other.min);
+        self.max = u64::max(self.max, other.max);
+        self.hist.add(&other.hist)
+    }
+
+    pub fn record(&mut self, value: u64) -> Result<(), hdrhistogram::RecordError> {
+        self.min = u64::min(self.min, value);
+        self.max = u64::max(self.max, value);
+        self.hist.record(value)
+    }
+
+    pub fn high(&self) -> u64 {
+        self.hist.high()
+    }
+}
 
 fn run<C>(global_args: &clap::ArgMatches, local_args: &clap::ArgMatches)
 where
@@ -62,31 +93,10 @@ where
         _ => unreachable!(),
     };
 
-    let hists = if let Some(mut f) = global_args
-        .value_of("histogram")
-        .and_then(|h| fs::File::open(h).ok())
-    {
-        use hdrhistogram::serialization::Deserializer;
-        let mut deserializer = Deserializer::new();
-        (
-            deserializer.deserialize(&mut f).unwrap(),
-            deserializer.deserialize(&mut f).unwrap(),
-            deserializer.deserialize(&mut f).unwrap(),
-            deserializer.deserialize(&mut f).unwrap(),
-        )
-    } else {
-        (
-            Histogram::<u64>::new_with_bounds(10, 1_000_000, 4).unwrap(),
-            Histogram::<u64>::new_with_bounds(10, 1_000_000, 4).unwrap(),
-            Histogram::<u64>::new_with_bounds(10, 1_000_000, 4).unwrap(),
-            Histogram::<u64>::new_with_bounds(10, 1_000_000, 4).unwrap(),
-        )
-    };
-
-    let sjrn_w_t = Arc::new(Mutex::new(hists.0));
-    let sjrn_r_t = Arc::new(Mutex::new(hists.1));
-    let rmt_w_t = Arc::new(Mutex::new(hists.2));
-    let rmt_r_t = Arc::new(Mutex::new(hists.3));
+    let sjrn_w_t = Arc::new(Mutex::new(Sampler::new()));
+    let sjrn_r_t = Arc::new(Mutex::new(Sampler::new()));
+    let rmt_w_t = Arc::new(Mutex::new(Sampler::new()));
+    let rmt_r_t = Arc::new(Mutex::new(Sampler::new()));
     let finished = Arc::new(Barrier::new(nthreads + ngen));
 
     let ts = (
@@ -181,62 +191,55 @@ where
     let rmt_w_t = rmt_w_t.lock().unwrap();
     let rmt_r_t = rmt_r_t.lock().unwrap();
 
-    if let Some(h) = global_args.value_of("histogram") {
-        match fs::File::create(h) {
-            Ok(mut f) => {
-                use hdrhistogram::serialization::Serializer;
-                use hdrhistogram::serialization::V2Serializer;
-                let mut s = V2Serializer::new();
-                s.serialize(&sjrn_w_t, &mut f).unwrap();
-                s.serialize(&sjrn_r_t, &mut f).unwrap();
-                s.serialize(&rmt_w_t, &mut f).unwrap();
-                s.serialize(&rmt_r_t, &mut f).unwrap();
-            }
-            Err(e) => {
-                eprintln!("failed to open histogram file for writing: {:?}", e);
-            }
-        }
-    }
-
     println!(
         "write\t50\t{:.2}\t{:.2}\t(all µs)",
-        sjrn_w_t.value_at_quantile(0.5),
-        rmt_w_t.value_at_quantile(0.5)
+        sjrn_w_t.hist.value_at_quantile(0.5),
+        rmt_w_t.hist.value_at_quantile(0.5)
     );
     println!(
         "read\t50\t{:.2}\t{:.2}\t(all µs)",
-        sjrn_r_t.value_at_quantile(0.5),
-        rmt_r_t.value_at_quantile(0.5)
+        sjrn_r_t.hist.value_at_quantile(0.5),
+        rmt_r_t.hist.value_at_quantile(0.5)
     );
     println!(
         "write\t95\t{:.2}\t{:.2}\t(all µs)",
-        sjrn_w_t.value_at_quantile(0.95),
-        rmt_w_t.value_at_quantile(0.95)
+        sjrn_w_t.hist.value_at_quantile(0.95),
+        rmt_w_t.hist.value_at_quantile(0.95)
     );
     println!(
         "read\t95\t{:.2}\t{:.2}\t(all µs)",
-        sjrn_r_t.value_at_quantile(0.95),
-        rmt_r_t.value_at_quantile(0.95)
+        sjrn_r_t.hist.value_at_quantile(0.95),
+        rmt_r_t.hist.value_at_quantile(0.95)
     );
     println!(
         "write\t99\t{:.2}\t{:.2}\t(all µs)",
-        sjrn_w_t.value_at_quantile(0.99),
-        rmt_w_t.value_at_quantile(0.99)
+        sjrn_w_t.hist.value_at_quantile(0.99),
+        rmt_w_t.hist.value_at_quantile(0.99)
     );
     println!(
         "read\t99\t{:.2}\t{:.2}\t(all µs)",
-        sjrn_r_t.value_at_quantile(0.99),
-        rmt_r_t.value_at_quantile(0.99)
+        sjrn_r_t.hist.value_at_quantile(0.99),
+        rmt_r_t.hist.value_at_quantile(0.99)
     );
     println!(
         "write\t100\t{:.2}\t{:.2}\t(all µs)",
-        sjrn_w_t.max(),
-        rmt_w_t.max()
+        sjrn_w_t.hist.max(),
+        rmt_w_t.hist.max()
     );
     println!(
         "read\t100\t{:.2}\t{:.2}\t(all µs)",
-        sjrn_r_t.max(),
-        rmt_r_t.max()
+        sjrn_r_t.hist.max(),
+        rmt_r_t.hist.max()
+    );
+    println!(
+        "write\t100 (real) \t{:.2}\t{:.2}\t(all µs)",
+        sjrn_w_t.max,
+        rmt_w_t.max
+    );
+    println!(
+        "read\t100 (real)\t{:.2}\t{:.2}\t(all µs)",
+        sjrn_r_t.max,
+        rmt_r_t.max
     );
 }
 
